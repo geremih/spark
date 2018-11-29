@@ -25,7 +25,7 @@ import java.util.function.BiFunction
 
 import scala.annotation.tailrec
 import scala.collection.Map
-import scala.collection.mutable.{ArrayStack, HashMap, HashSet}
+import scala.collection.mutable.{ArrayStack, HashMap, HashSet, Set}
 import scala.concurrent.duration._
 import scala.language.existentials
 import scala.language.postfixOps
@@ -149,6 +149,13 @@ private[spark] class DAGScheduler(
    * the shuffle data will be in the MapOutputTracker).
    */
   private[scheduler] val shuffleIdToMapStage = new HashMap[Int, ShuffleMapStage]
+
+  /**
+   * Mapping from shuffle dependency ID to the IDs of the stages which depend on the shuffle data.
+   * Used to track when shuffle data becomes no longer active.
+   */
+  private[scheduler] val shuffleIdToDependentStages = new HashMap[Int, Set[Int]]
+
   private[scheduler] val jobIdToActiveJob = new HashMap[Int, ActiveJob]
 
   // Stages we need to run whose parents aren't done
@@ -396,8 +403,11 @@ private[spark] class DAGScheduler(
     stageIdToStage(id) = stage
     shuffleIdToMapStage(shuffleDep.shuffleId) = stage
     updateJobIdStageIdMaps(jobId, stage)
+    updateShuffleDependenciesMap(stage)
 
-    if (!mapOutputTracker.containsShuffle(shuffleDep.shuffleId)) {
+    if (mapOutputTracker.containsShuffle(shuffleDep.shuffleId)) {
+      mapOutputTracker.markShuffleActive(shuffleDep.shuffleId)
+    } else {
       // Kind of ugly: need to register RDDs with the cache and map output tracker here
       // since we can't do it in the RDD constructor because # of partitions is unknown
       logInfo("Registering RDD " + rdd.id + " (" + rdd.getCreationSite + ")")
@@ -453,6 +463,7 @@ private[spark] class DAGScheduler(
     val stage = new ResultStage(id, rdd, func, partitions, parents, jobId, callSite)
     stageIdToStage(id) = stage
     updateJobIdStageIdMaps(jobId, stage)
+    updateShuffleDependenciesMap(stage)
     stage
   }
 
@@ -600,6 +611,17 @@ private[spark] class DAGScheduler(
   }
 
   /**
+   * Registers the shuffle dependencies of the given stage.
+   */
+  private def updateShuffleDependenciesMap(stage: Stage): Unit = {
+    getShuffleDependencies(stage.rdd).foreach { shuffleDep =>
+      val shuffleId = shuffleDep.shuffleId
+      logDebug("Tracking that stage " + stage.id + " depends on shuffle " + shuffleId)
+      shuffleIdToDependentStages.getOrElseUpdate(shuffleId, Set.empty) += stage.id
+    }
+  }
+
+  /**
    * Removes state for job and any stages that are not needed by any other job.  Does not
    * handle cancelling tasks or notifying the SparkListener about finished jobs/stages/tasks.
    *
@@ -627,6 +649,7 @@ private[spark] class DAGScheduler(
                 }
                 for ((k, v) <- shuffleIdToMapStage.find(_._2 == stage)) {
                   shuffleIdToMapStage.remove(k)
+                  mapOutputTracker.markShuffleInactive(k)
                 }
                 if (waitingStages.contains(stage)) {
                   logDebug("Removing stage %d from waiting set.".format(stageId))
@@ -1346,6 +1369,31 @@ private[spark] class DAGScheduler(
       case _: ExceptionFailure | _: TaskKilled => updateAccumulators(event)
       case _ =>
     }
+
+    // Make sure shuffle outputs are registered before we post the event so that
+    // handlers can act on up-to-date shuffle information.
+    event.reason match {
+      case Success =>
+        task match {
+          case smt: ShuffleMapTask =>
+            val shuffleStage = stage.asInstanceOf[ShuffleMapStage]
+            val status = event.result.asInstanceOf[MapStatus]
+            val execId = status.location.executorId
+            logDebug("Registering shuffle output on executor " + execId)
+            if (failedEpoch.contains(execId) && smt.epoch <= failedEpoch(execId)) {
+              logInfo(s"Ignoring possibly bogus $smt completion from executor $execId")
+            } else {
+              // The epoch of the task is acceptable (i.e., the task was launched after the most
+              // recent failure we're aware of for the executor), so mark the task's output as
+              // available.
+              mapOutputTracker.registerMapOutput(
+                shuffleStage.shuffleDep.shuffleId, smt.partitionId, status)
+            }
+          case _ =>
+        }
+      case _ =>
+    }
+
     postTaskEnd(event)
 
     event.reason match {
@@ -1382,21 +1430,12 @@ private[spark] class DAGScheduler(
                 logInfo("Ignoring result from " + rt + " because its job has finished")
             }
 
-          case smt: ShuffleMapTask =>
+          case _: ShuffleMapTask =>
             val shuffleStage = stage.asInstanceOf[ShuffleMapStage]
             shuffleStage.pendingPartitions -= task.partitionId
             val status = event.result.asInstanceOf[MapStatus]
             val execId = status.location.executorId
             logDebug("ShuffleMapTask finished on " + execId)
-            if (failedEpoch.contains(execId) && smt.epoch <= failedEpoch(execId)) {
-              logInfo(s"Ignoring possibly bogus $smt completion from executor $execId")
-            } else {
-              // The epoch of the task is acceptable (i.e., the task was launched after the most
-              // recent failure we're aware of for the executor), so mark the task's output as
-              // available.
-              mapOutputTracker.registerMapOutput(
-                shuffleStage.shuffleDep.shuffleId, smt.partitionId, status)
-            }
 
             if (runningStages.contains(shuffleStage) && shuffleStage.pendingPartitions.isEmpty) {
               markStageAsFinished(shuffleStage)
@@ -1838,6 +1877,24 @@ private[spark] class DAGScheduler(
       case Some(t) => "%.03f".format((clock.getTimeMillis() - t) / 1000.0)
       case _ => "Unknown"
     }
+
+    getShuffleDependencies(stage.rdd).foreach { shuffleDep =>
+      val shuffleId = shuffleDep.shuffleId
+      if (!shuffleIdToDependentStages.contains(shuffleId)) {
+        logDebug("Stage finished with untracked shuffle dependency " + shuffleId)
+      } else {
+        var dependentStages = shuffleIdToDependentStages(shuffleId)
+        dependentStages -= stage.id;
+        logDebug("Stage " + stage.id + " finished.  " +
+          "Shuffle " + shuffleId + " now has dependencies " + dependentStages)
+        if (dependentStages.isEmpty) {
+          logDebug("Shuffle " + shuffleId + " is no longer needed.  Marking it inactive.")
+          shuffleIdToDependentStages.remove(shuffleId)
+          mapOutputTracker.markShuffleInactive(shuffleId)
+        }
+      }
+    }
+
     if (errorMessage.isEmpty) {
       logInfo("%s (%s) finished in %s s".format(stage, stage.name, serviceTime))
       stage.latestInfo.completionTime = Some(clock.getTimeMillis())
